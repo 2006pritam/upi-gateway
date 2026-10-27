@@ -1,0 +1,73 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Checkout</title><style>
+:root{--c:#0f766e}body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f9;color:#111}header{background:var(--c);color:#fff;padding:16px 20px;display:flex;gap:12px;align-items:center}header img{height:36px;border-radius:8px}.wrap{max-width:720px;margin:0 auto;padding:20px}.card{background:#fff;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 4px #0001}button{background:var(--c);color:#fff;border:0;border-radius:10px;padding:12px 18px;font-size:16px;cursor:pointer}input{width:100%;padding:11px;border:1px solid #ccc;border-radius:10px;font-size:16px;box-sizing:border-box}label{display:block;margin:10px 0 4px;font-weight:600}.row{display:flex;gap:10px;align-items:center;justify-content:space-between}.muted{color:#666;font-size:14px}.demo{background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:12px;margin:12px 0}.ok{color:#047857;font-weight:700}.hidden{display:none}#modal{position:fixed;inset:0;background:#0008;display:none;align-items:flex-end;justify-content:center}#modal.open{display:flex}.sheet{background:#fff;width:100%;max-width:520px;border-radius:20px 20px 0 0;padding:20px;max-height:92vh;overflow:auto}@media(min-width:600px){#modal{align-items:center}.sheet{border-radius:20px}}
+</style></head><body>
+<header><img id="logo" class="hidden"><div><div id="brand" style="font-weight:800;font-size:20px">Demo Store</div><div class="muted" style="color:#e0f2f1">White-label checkout — your brand, your UPI ID</div></div><div style="margin-left:auto"><a href="/admin.html" style="color:#fff">Admin →</a></div></header>
+<div class="wrap">
+<div class="card"><h2 style="margin-top:0">Demo store</h2><p class="muted">Pick an item, pay with UPI, and watch the status update live. This demo uses test amounts — change the UPI ID in Admin before any real use.</p>
+<div class="row"><span>☕ Chai + snack combo</span><strong>₹49.00</strong><button data-upi-pay data-amount="49" data-description="Chai + snack combo">Pay ₹49</button></div><hr>
+<div class="row"><span>📚 Notebook bundle</span><strong>₹249.00</strong><button data-upi-pay data-amount="249" data-description="Notebook bundle">Pay ₹249</button></div><hr>
+<div class="row"><span>🎧 Headphones</span><strong>₹999.00</strong><button data-upi-pay data-amount="999" data-description="Headphones">Pay ₹999</button></div>
+<p class="muted">Or enter any amount: <input id="customAmt" type="number" min="1" step="0.01" placeholder="e.g. 125.50" style="margin-top:8px"> <button id="customPay" style="margin-top:10px">Pay custom amount</button></p>
+</div>
+<div class="card"><h3 style="margin-top:0">How verification works here</h3><p class="muted">Only one UPI payment is ACTIVE at a time, so two ₹49 payments can't be mixed up. Others wait in a queue. A payment is confirmed only when a bank SMS / Gmail alert with the exact amount arrives (try it from Admin → Simulate bank alert), or the merchant confirms a cash/card counter sale. SMS/email matching is a helpful signal, not bank settlement proof — reconcile with your statement.</p></div>
+</div>
+<div id="modal"><div class="sheet">
+<div class="row"><h2 id="mTitle" style="margin:0">Pay</h2><button id="closeBtn" style="background:#eee;color:#111">✕</button></div>
+<div id="stepPhone"><label>Mobile number (WhatsApp OTP)</label><input id="phone" inputmode="numeric" placeholder="10-digit mobile, e.g. 9876543210"><button id="sendOtp" style="margin-top:12px;width:100%">Send WhatsApp OTP</button><p id="otpMsg" class="muted"></p></div>
+<div id="stepOtp" class="hidden"><label>Enter 6-digit OTP</label><input id="otp" inputmode="numeric" placeholder="123456"><button id="verifyOtp" style="margin-top:12px;width:100%">Verify &amp; continue</button><p id="otpMsg2" class="muted"></p></div>
+<div id="stepPay" class="hidden"><p id="queueNote" class="muted"></p><div id="qrBox" style="text-align:center"></div><p id="payMeta" class="muted" style="text-align:center"></p><a id="upiLink" href="#" style="display:block;text-align:center;margin:12px 0;font-weight:700">Open in UPI app (mobile)</a><p class="muted" style="text-align:center">Works with GPay, PhonePe, Paytm, BHIM and other UPI apps. On desktop, scan the QR.</p><p id="statusLine" style="text-align:center;font-weight:700">⏳ Pending — waiting for payment…</p><button id="cancelBtn" style="background:#eee;color:#111;width:100%">Cancel payment</button></div>
+<div id="stepDone" class="hidden"><h3 class="ok">✓ Payment confirmed</h3><p id="doneMeta" class="muted"></p><button onclick="closeModal()" style="width:100%">Done</button></div>
+</div></div>
+<script>
+let cur=null, es=null;
+async function loadBrand(){const m=await (await fetch('/api/merchant')).json();document.getElementById('brand').textContent=m.businessName;document.documentElement.style.setProperty('--c',m.primaryColor||'#0f766e');if(m.logoUrl){const l=document.getElementById('logo');l.src=m.logoUrl;l.classList.remove('hidden');}}
+loadBrand();
+const qp=new URLSearchParams(location.search); if(qp.get('amount')) setTimeout(()=>startPay(qp.get('amount'),qp.get('description')||'Order'),300);
+function openModal(){document.getElementById('modal').classList.add('open')}
+function closeModal(){document.getElementById('modal').classList.remove('open');if(es)es.close();es=null}
+document.getElementById('closeBtn').onclick=closeModal;
+document.getElementById('customPay').onclick=()=>{const a=document.getElementById('customAmt').value;if(a)startPay(a,'Custom amount')};
+async function startPay(amount,desc){
+  const r=await fetch('/api/checkout',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({amount:Number(amount),description:desc})});
+  cur=await r.json(); if(cur.error){alert(cur.error);return}
+  document.getElementById('mTitle').textContent=`Pay ₹${Number(amount).toFixed(2)}`;
+  document.getElementById('stepPhone').classList.remove('hidden');document.getElementById('stepOtp').classList.add('hidden');document.getElementById('stepPay').classList.add('hidden');document.getElementById('stepDone').classList.add('hidden');
+  openModal(); watchStatus();
+}
+window.UpiPay={pay:(o)=>startPay(o.amount,o.description||'Order')};
+document.querySelectorAll('[data-upi-pay]').forEach(b=>b.onclick=()=>startPay(b.dataset.amount,b.dataset.description||'Order'));
+document.getElementById('sendOtp').onclick=async()=>{
+  const phone=document.getElementById('phone').value;
+  const r=await fetch('/api/otp/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({paymentId:cur.id,phone})});
+  const d=await r.json();
+  document.getElementById('otpMsg').innerHTML=d.error?d.error:(d.mode==='demo'?`<div class="demo"><b>Demo mode:</b> WhatsApp is not configured, so your code is shown here: <b style="font-size:20px">${d.demoOtp}</b><br><span class="muted">With WHATSAPP_* set, this would arrive as an approved WhatsApp Authentication template message instead.</span></div>`:'OTP sent on WhatsApp. Check your messages.');
+  if(!d.error){document.getElementById('stepOtp').classList.remove('hidden');}
+};
+document.getElementById('verifyOtp').onclick=async()=>{
+  const code=document.getElementById('otp').value;
+  const r=await fetch('/api/otp/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({paymentId:cur.id,code})});
+  const d=await r.json();
+  if(d.verified){document.getElementById('stepPhone').classList.add('hidden');document.getElementById('stepOtp').classList.add('hidden');document.getElementById('stepPay').classList.remove('hidden');showQr();}
+  else document.getElementById('otpMsg2').textContent=d.error||'Verification failed';
+};
+async function showQr(){
+  const r=await fetch(`/api/payments/${cur.id}/qr`);const d=await r.json();
+  if(d.error){document.getElementById('queueNote').textContent=d.error;setTimeout(showQr,3000);return}
+  document.getElementById('queueNote').textContent='';
+  document.getElementById('qrBox').innerHTML=`<img src="${d.qrDataUrl}" alt="UPI QR" style="width:260px;height:260px">`;
+  document.getElementById('payMeta').textContent=`Pay ₹${d.amount} to ${d.payee} (${d.upiId})`;
+  const a=document.getElementById('upiLink');a.href=d.upiUri;
+}
+document.getElementById('cancelBtn').onclick=async()=>{await fetch(`/api/payments/${cur.id}/cancel`,{method:'POST'});closeModal()};
+function watchStatus(){
+  if(es)es.close();
+  es=new EventSource(`/api/payments/${cur.id}/events`);
+  es.onmessage=(e)=>{const p=JSON.parse(e.data);
+    if(p.status==='CONFIRMED'){document.getElementById('stepPay').classList.add('hidden');document.getElementById('stepDone').classList.remove('hidden');document.getElementById('doneMeta').textContent=`${p.method} • UTR: ${p.utr||'—'} • Verified via: ${p.verification||'—'}`;es.close();}
+    else if(p.status==='QUEUED'){document.getElementById('queueNote').textContent=`You are in the queue (position ${p.position}). Only one UPI payment is active at a time so amounts don't get mixed up. Keep this open — you'll move up automatically.`;document.getElementById('stepPay').classList.remove('hidden');document.getElementById('stepPhone').classList.add('hidden');document.getElementById('stepOtp').classList.add('hidden');}
+    else if(p.status==='ACTIVE' && p.phoneVerified){showQr();}
+    else if(['EXPIRED','CANCELLED'].includes(p.status)){document.getElementById('statusLine').textContent=`Payment ${p.status.toLowerCase()}. Please start again.`;}
+  };
+}
+</script></body></html>
