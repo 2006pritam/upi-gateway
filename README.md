@@ -2,7 +2,7 @@
 
 A single-service gateway you run yourself: a white-label checkout for
 customers, a clean admin dashboard for the merchant, one active UPI payment
-at a time, WhatsApp OTP before the QR, dynamic UPI QR / mobile intent,
+at a time, dynamic UPI QR / mobile intent,
 real-time status, bank SMS + Gmail alert verification, and cash/card
 counter billing.
 
@@ -14,7 +14,7 @@ counter billing.
 ```bash
 cd upi-gateway
 npm install
-cp .env.example .env   # edit UPI ID, WhatsApp, tokens
+cp .env.example .env   # edit UPI ID and tokens (optional)
 npm start              # http://localhost:8787
 ```
 
@@ -25,8 +25,9 @@ npm start              # http://localhost:8787
 ## Customer flow
 
 1. Click **Pay** on the merchant site.
-2. Enter a 10-digit mobile number, verify the 6-digit WhatsApp OTP
-   (5-minute expiry, 5 attempts).
+2. Go straight to the QR — no OTP, no signup. (v2, on the merchant's
+   request: the old WhatsApp OTP gate was removed for a Razorpay-style
+   easy checkout.)
 3. If another UPI payment is active, you wait in a FIFO queue — this is
    deliberate: with plain UPI alerts, two identical amounts at the same
    time can't be told apart, so only one payment is ACTIVE at a time.
@@ -56,6 +57,33 @@ On your own website, load the gateway's script and tag a button:
 ```
 
 Or programmatically: `window.UpiPay.pay({ amount: 499, description: 'Pro plan' })`.
+
+### Server-side API — Razorpay-style (recommended)
+
+Your server creates an order with your API key (shown in Admin →
+API integration), then sends the customer to the checkout URL:
+
+```bash
+curl -X POST https://YOUR-GATEWAY/api/v1/orders \
+  -H "x-api-key: YOUR_API_KEY" -H "content-type: application/json" \
+  -d '{"amount": 49900, "receipt": "ORDER-1001"}'
+# amount is in PAISE: 49900 = Rs 499.00
+# → { "id": "PAY-…", "status": "created",
+#     "checkout_url": "https://YOUR-GATEWAY/?payment=PAY-…" }
+```
+
+Then poll the order, or wait for the webhook:
+
+```bash
+curl https://YOUR-GATEWAY/api/v1/orders/PAY-… -H "x-api-key: YOUR_API_KEY"
+# status: "created" → "paid" (gateway_status: CONFIRMED, with utr)
+```
+
+In the browser, after creating an order server-side:
+
+```javascript
+new UpiCheckout({ order_id: 'PAY-…' }).open();
+```
 
 Branding and bank details are set in Admin, not in code: business name,
 UPI ID, payee name, logo, primary colour, webhook URL/secret. The
@@ -110,28 +138,26 @@ Admin → Counter billing records a `CASH` or `CARD` sale immediately
 (cashier saw the cash / card terminal approval). It bypasses the UPI
 queue and appears in the same orders/history/export as UPI payments.
 
-## WhatsApp OTP — real delivery
+## No OTP in v2 — and the trade-off
 
-Real delivery needs Meta's WhatsApp Cloud API:
-
-1. Meta developer app + verified business + WhatsApp Business Account.
-2. An approved **Authentication** template (fixed wording:
-   “`<code>` is your verification code.”, plus optional expiry line
-   and a copy-code / one-tap button — you cannot customise the wording).
-3. Set `WHATSAPP_TOKEN` (permanent System User token),
-   `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_TEMPLATE_NAME`.
-
-Without those, the server is in **demo mode** and shows the code on
-screen. That is for local testing only — never tell customers a demo
-code was “sent on WhatsApp”.
+The original WhatsApp OTP gate was removed because the merchant asked for
+an easy, Razorpay-like checkout. That makes checkout faster, but it also
+means anyone can create an order and occupy the single active slot until
+it expires (5 minutes). Kept as mitigations: the single-slot queue,
+5-minute expiry, a checkout rate limit, API-key auth for server-side
+order creation, and exact-amount alert matching before any payment is
+marked CONFIRMED. If fake orders become a problem, re-add a verification
+step (email OTP, CAPTCHA, or login) in front of order creation — do not
+rely on the QR alone to prove who the customer is.
 
 ## API summary
 
 | Method | Endpoint | Notes |
 |---|---|---|
 | POST | `/api/checkout` | `{amount, orderId?, description?}` → payment, queue position |
-| POST | `/api/otp/send` | `{paymentId, phone}` |
-| POST | `/api/otp/verify` | `{paymentId, code}` |
+| POST | `/api/v1/orders` | Razorpay-style: `{amount (paise), receipt?, notes?}` + `x-api-key` → order + `checkout_url` |
+| GET | `/api/v1/orders/:id` | Order status: `created` → `paid`, with `gateway_status` and `utr` |
+| POST | `/api/admin/api-key/regenerate` | New API key (admin token if set) |
 | GET | `/api/payments/:id` | Status + queue position |
 | GET | `/api/payments/:id/qr` | Dynamic QR + UPI intent (verified + ACTIVE only) |
 | GET | `/api/payments/:id/events` | SSE live status |
@@ -154,8 +180,8 @@ any serious volume.
   payment per merchant at a time, 5-minute windows). For high volume,
   use a real PSP/bank aggregator API with per-order virtual accounts
   or collect requests instead of alert matching.
-- WhatsApp OTP via a personal WhatsApp number / unofficial client
-  (e.g. Baileys-style sockets) risks bans — use the official Cloud API.
+- No OTP means no phone verification: treat every order as untrusted
+  until the payment is confirmed and the webhook is verified server-side.
 - This starter has no PCI card processing: “card” here means the
   merchant's existing POS terminal, recorded in the dashboard.
 - Set `ADMIN_TOKEN` and `OBSERVER_SECRET`, run behind HTTPS and real

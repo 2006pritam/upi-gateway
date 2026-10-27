@@ -14,8 +14,7 @@
 </div>
 <div id="modal"><div class="sheet">
 <div class="row"><h2 id="mTitle" style="margin:0">Pay</h2><button id="closeBtn" style="background:#eee;color:#111">✕</button></div>
-<div id="stepPhone"><label>Mobile number (WhatsApp OTP)</label><input id="phone" inputmode="numeric" placeholder="10-digit mobile, e.g. 9876543210"><button id="sendOtp" style="margin-top:12px;width:100%">Send WhatsApp OTP</button><p id="otpMsg" class="muted"></p></div>
-<div id="stepOtp" class="hidden"><label>Enter 6-digit OTP</label><input id="otp" inputmode="numeric" placeholder="123456"><button id="verifyOtp" style="margin-top:12px;width:100%">Verify &amp; continue</button><p id="otpMsg2" class="muted"></p></div>
+<p class="muted">No OTP, no signup — just scan and pay. This is the easy, Razorpay-style flow: click Pay, get a QR / UPI link, pay in your UPI app.</p>
 <div id="stepPay" class="hidden"><p id="queueNote" class="muted"></p><div id="qrBox" style="text-align:center"></div><p id="payMeta" class="muted" style="text-align:center"></p><a id="upiLink" href="#" style="display:block;text-align:center;margin:12px 0;font-weight:700">Open in UPI app (mobile)</a><p class="muted" style="text-align:center">Works with GPay, PhonePe, Paytm, BHIM and other UPI apps. On desktop, scan the QR.</p><p id="statusLine" style="text-align:center;font-weight:700">⏳ Pending — waiting for payment…</p><button id="cancelBtn" style="background:#eee;color:#111;width:100%">Cancel payment</button></div>
 <div id="stepDone" class="hidden"><h3 class="ok">✓ Payment confirmed</h3><p id="doneMeta" class="muted"></p><button onclick="closeModal()" style="width:100%">Done</button></div>
 </div></div>
@@ -23,7 +22,9 @@
 let cur=null, es=null;
 async function loadBrand(){const m=await (await fetch('/api/merchant')).json();document.getElementById('brand').textContent=m.businessName;document.documentElement.style.setProperty('--c',m.primaryColor||'#0f766e');if(m.logoUrl){const l=document.getElementById('logo');l.src=m.logoUrl;l.classList.remove('hidden');}}
 loadBrand();
-const qp=new URLSearchParams(location.search); if(qp.get('amount')) setTimeout(()=>startPay(qp.get('amount'),qp.get('description')||'Order'),300);
+const qp=new URLSearchParams(location.search);
+if(qp.get('payment')||qp.get('order')){const pid=qp.get('payment')||qp.get('order');fetch(`/api/payments/${pid}`).then(r=>r.json()).then(p=>{if(!p.error){cur=p;document.getElementById('mTitle').textContent=`Pay ₹${(p.amountPaise/100).toFixed(2)}`;document.getElementById('stepPay').classList.remove('hidden');openModal();watchStatus();showQr();}});}
+else if(qp.get('amount')) setTimeout(()=>startPay(qp.get('amount'),qp.get('description')||'Order'),300);
 function openModal(){document.getElementById('modal').classList.add('open')}
 function closeModal(){document.getElementById('modal').classList.remove('open');if(es)es.close();es=null}
 document.getElementById('closeBtn').onclick=closeModal;
@@ -32,25 +33,11 @@ async function startPay(amount,desc){
   const r=await fetch('/api/checkout',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({amount:Number(amount),description:desc})});
   cur=await r.json(); if(cur.error){alert(cur.error);return}
   document.getElementById('mTitle').textContent=`Pay ₹${Number(amount).toFixed(2)}`;
-  document.getElementById('stepPhone').classList.remove('hidden');document.getElementById('stepOtp').classList.add('hidden');document.getElementById('stepPay').classList.add('hidden');document.getElementById('stepDone').classList.add('hidden');
-  openModal(); watchStatus();
+  document.getElementById('stepPay').classList.remove('hidden');document.getElementById('stepDone').classList.add('hidden');
+  openModal(); watchStatus(); showQr();
 }
 window.UpiPay={pay:(o)=>startPay(o.amount,o.description||'Order')};
 document.querySelectorAll('[data-upi-pay]').forEach(b=>b.onclick=()=>startPay(b.dataset.amount,b.dataset.description||'Order'));
-document.getElementById('sendOtp').onclick=async()=>{
-  const phone=document.getElementById('phone').value;
-  const r=await fetch('/api/otp/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({paymentId:cur.id,phone})});
-  const d=await r.json();
-  document.getElementById('otpMsg').innerHTML=d.error?d.error:(d.mode==='demo'?`<div class="demo"><b>Demo mode:</b> WhatsApp is not configured, so your code is shown here: <b style="font-size:20px">${d.demoOtp}</b><br><span class="muted">With WHATSAPP_* set, this would arrive as an approved WhatsApp Authentication template message instead.</span></div>`:'OTP sent on WhatsApp. Check your messages.');
-  if(!d.error){document.getElementById('stepOtp').classList.remove('hidden');}
-};
-document.getElementById('verifyOtp').onclick=async()=>{
-  const code=document.getElementById('otp').value;
-  const r=await fetch('/api/otp/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({paymentId:cur.id,code})});
-  const d=await r.json();
-  if(d.verified){document.getElementById('stepPhone').classList.add('hidden');document.getElementById('stepOtp').classList.add('hidden');document.getElementById('stepPay').classList.remove('hidden');showQr();}
-  else document.getElementById('otpMsg2').textContent=d.error||'Verification failed';
-};
 async function showQr(){
   const r=await fetch(`/api/payments/${cur.id}/qr`);const d=await r.json();
   if(d.error){document.getElementById('queueNote').textContent=d.error;setTimeout(showQr,3000);return}
@@ -65,8 +52,8 @@ function watchStatus(){
   es=new EventSource(`/api/payments/${cur.id}/events`);
   es.onmessage=(e)=>{const p=JSON.parse(e.data);
     if(p.status==='CONFIRMED'){document.getElementById('stepPay').classList.add('hidden');document.getElementById('stepDone').classList.remove('hidden');document.getElementById('doneMeta').textContent=`${p.method} • UTR: ${p.utr||'—'} • Verified via: ${p.verification||'—'}`;es.close();}
-    else if(p.status==='QUEUED'){document.getElementById('queueNote').textContent=`You are in the queue (position ${p.position}). Only one UPI payment is active at a time so amounts don't get mixed up. Keep this open — you'll move up automatically.`;document.getElementById('stepPay').classList.remove('hidden');document.getElementById('stepPhone').classList.add('hidden');document.getElementById('stepOtp').classList.add('hidden');}
-    else if(p.status==='ACTIVE' && p.phoneVerified){showQr();}
+    else if(p.status==='QUEUED'){document.getElementById('queueNote').textContent=`You are in the queue (position ${p.position}). Only one UPI payment is active at a time so amounts don't get mixed up. Keep this open — you'll move up automatically.`;document.getElementById('stepPay').classList.remove('hidden');}
+    else if(p.status==='ACTIVE'){showQr();}
     else if(['EXPIRED','CANCELLED'].includes(p.status)){document.getElementById('statusLine').textContent=`Payment ${p.status.toLowerCase()}. Please start again.`;}
   };
 }

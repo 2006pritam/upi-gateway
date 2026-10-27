@@ -4,6 +4,14 @@
 <div class="wrap">
 <div id="warn" class="warn hidden"></div>
 <div class="card"><h2 style="margin-top:0">Queue right now</h2><p id="queueBox" class="muted">Loading…</p><button onclick="load()">Refresh</button></div>
+<div class="card"><h2 style="margin-top:0">API integration — like Razorpay, but self-hosted</h2><p class="muted">Your server creates an order, then opens the checkout URL. No OTP step for the customer.</p>
+<p>API key: <code id="apiKeyBox">loading…</code> <button onclick="regenKey()">Regenerate key</button></p>
+<pre style="white-space:pre-wrap;background:#f6f7f9;padding:12px;border-radius:10px">curl -X POST https://YOUR-GATEWAY/api/v1/orders \
+  -H "x-api-key: YOUR_API_KEY" -H "content-type: application/json" \
+  -d '{"amount": 4900, "receipt": "ORDER-1001"}'
+# → { "id": "PAY-…", "status": "created", "checkout_url": "https://YOUR-GATEWAY/?payment=PAY-…" }
+# Open checkout_url for the customer. Poll GET /api/v1/orders/:id
+# (status: created → paid) or wait for the webhook on payment success.</pre></div>
 <div class="card"><h2 style="margin-top:0">Counter billing — cash / card</h2><p class="muted">For in-person sales. This confirms immediately because the cashier saw the cash or card terminal result — it does not go through the UPI queue.</p>
 <label>Amount (₹)</label><input id="cAmt" type="number" step="0.01"><label>Method</label><select id="cMethod"><option>CASH</option><option>CARD</option></select><label>Reference (card approval / receipt no., optional)</label><input id="cRef"><label>Description</label><input id="cDesc" placeholder="Counter sale"><button onclick="counter()">Record counter payment</button><p id="cMsg" class="muted"></p></div>
 <div class="card"><h2 style="margin-top:0">Simulate a bank alert (test the auto-verification)</h2><p class="muted">Paste a real-format alert, e.g. <code>Rs.49.00 credited to your account via UPI. UTR 123456789012</code>. It only confirms if it matches the ONE active payment's exact amount. Duplicates are ignored.</p>
@@ -21,11 +29,13 @@ async function load(){
   if(d.error){document.getElementById('queueBox').textContent=d.error;return}
   document.getElementById('queueBox').innerHTML=d.active?`ACTIVE: ${d.active.orderId} — ₹${(d.active.amountPaise/100).toFixed(2)} (${d.active.status})`:'No active UPI payment.';
   if(d.queue.length) document.getElementById('queueBox').innerHTML+=`<br>QUEUED: ${d.queue.map(q=>q.orderId+' ₹'+(q.amountPaise/100).toFixed(2)).join(', ')}`;
-  if(d.demoMode){const w=document.getElementById('warn');w.classList.remove('hidden');w.innerHTML='<b>Demo mode:</b> WhatsApp OTP codes are shown on screen because WHATSAPP_* is not configured. Set it before real use, and set ADMIN_TOKEN + put this page behind auth before exposing it.'}
+  {const w=document.getElementById('warn');w.classList.remove('hidden');w.innerHTML='<b>Easy checkout:</b> no OTP step — customers go straight to the QR. Before real use, set ADMIN_TOKEN + put this page behind auth, and change the UPI ID from demo@upi to yours.'}
+  document.getElementById('apiKeyBox').textContent=d.merchant.apiKey||'(no key yet — restart the server to generate one)';
   for(const k of ['businessName','upiId','payeeName','bankName','accountHolder','logoUrl','primaryColor','webhookUrl']) document.getElementById(k).value=d.merchant[k]||'';
   document.getElementById('rows').innerHTML=d.payments.map(p=>`<tr><td>${p.orderId}</td><td>₹${(p.amountPaise/100).toFixed(2)}</td><td>${p.status}</td><td>${p.method}</td><td>${p.utr||'—'}</td><td>${p.verification||'—'}</td><td>${new Date(p.createdAt).toLocaleString()}</td><td>${(p.status==='ACTIVE'||p.status==='QUEUED')?`<button onclick="manual('${p.id}')">Confirm manually</button>`:''}</td></tr>`).join('');
   document.getElementById('obs').innerHTML=d.observations.length?d.observations.map(o=>`${new Date(o.at).toLocaleTimeString()} — ${o.source} — ${o.matched?'✅ matched '+o.paymentId:'❌ '+o.reason} — ₹${o.amountPaise? (o.amountPaise/100).toFixed(2):'?'}`).join('<br>'):'No alerts yet.';
 }
+async function regenKey(){const r=await fetch('/api/admin/api-key/regenerate',{method:'POST',headers:H});const d=await r.json();if(d.apiKey)document.getElementById('apiKeyBox').textContent=d.apiKey;load();}
 async function counter(){const r=await fetch('/api/counter',{method:'POST',headers:H,body:JSON.stringify({amount:Number(document.getElementById('cAmt').value),method:document.getElementById('cMethod').value,reference:document.getElementById('cRef').value,description:document.getElementById('cDesc').value})});const d=await r.json();document.getElementById('cMsg').textContent=d.error||`Recorded: ${d.orderId} ₹${(d.amountPaise/100).toFixed(2)} via ${d.method}`;load();}
 async function simulate(kind){const r=await fetch(`/api/verify/${kind}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:document.getElementById('alertText').value})});const d=await r.json();document.getElementById('sMsg').textContent=d.error||JSON.stringify(d);load();}
 async function saveMerchant(){const b={};for(const k of ['businessName','upiId','payeeName','bankName','accountHolder','logoUrl','primaryColor','webhookUrl','webhookSecret']){const v=document.getElementById(k).value;if(v)b[k]=v}const r=await fetch('/api/admin/merchant',{method:'POST',headers:H,body:JSON.stringify(b)});const d=await r.json();document.getElementById('mMsg').textContent=d.error||'Saved.';}

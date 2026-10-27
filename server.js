@@ -8,10 +8,13 @@
 //   SMS / email parsing is heuristic, can be delayed, duplicated or spoofed, and
 //   is NOT by itself proof of settlement. Always reconcile against the bank
 //   statement before fulfilling high-value orders.
-// * WhatsApp OTP is only really delivered when WHATSAPP_* env vars are set
-//   (Meta WhatsApp Cloud API, approved Authentication template). Without them
-//   the server runs in DEMO mode and shows the code on screen — it must never
-//   be presented as "sent on WhatsApp" in that mode.
+// * v2: NO OTP gate. The user asked for a Razorpay-style easy checkout:
+//   click Pay -> QR / UPI intent directly, no phone verification step.
+//   Trade-off, stated honestly: without verification anyone can create an
+//   order and occupy the single active slot until it expires (5 min).
+//   Mitigations kept: one active slot, 5-min expiry, checkout rate limit,
+//   API-key auth for server-side order creation, and exact-amount alert
+//   matching before any payment is marked CONFIRMED.
 // * This is not a certified / NPCI-approved payment aggregator and does not
 //   authorise operating one. Check bank terms and local regulations first.
 // * Put the admin behind real auth (ADMIN_TOKEN + reverse proxy) before
@@ -26,7 +29,8 @@ const PORT = Number(process.env.PORT || 8787);
 const DATA_FILE = path.join(__dirname, 'data', 'db.json');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const OBSERVER_SECRET = process.env.OBSERVER_SECRET || '';
-const DEMO_MODE = !process.env.WHATSAPP_TOKEN;
+const VERSION = '2.0-no-otp';
+const DEMO_MODE = !process.env.WHATSAPP_TOKEN; // legacy flag, OTP no longer used
 
 // ---------- helpers ----------
 const paise = (rupees) => Math.round(Number(rupees) * 100);
@@ -76,11 +80,30 @@ if (!db.merchant) {
   };
 }
 db.payments ||= []; db.observations ||= []; db.webhookLog ||= [];
+if (!db.merchant.apiKey) { db.merchant.apiKey = 'upg_' + crypto.randomBytes(16).toString('hex'); }
+
 function save() { fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true }); fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db, null, 2)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); }
 if (!fs.existsSync(DATA_FILE)) save();
 
-const otps = new Map(); // paymentId -> {hash, expiresAt, attempts, phone}
 const sseClients = new Set();
+const rateHits = new Map(); // ip -> [timestamps]
+function rateLimited(req, limit = 10, windowMs = 60 * 1000) {
+  const ip = req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const hits = (rateHits.get(ip) || []).filter(t => now - t < windowMs);
+  hits.push(now); rateHits.set(ip, hits);
+  return hits.length > limit;
+}
+function requireApiKey(req, res) {
+  const provided = req.headers['x-api-key'] || String(req.headers.authorization || '').replace(/^Bearer /i, '');
+  if (db.merchant.apiKey && provided !== db.merchant.apiKey) { send(res, 401, { error: 'Valid API key required. Copy it from Admin -> API integration.' }); return false; }
+  return true;
+}
+function checkoutUrlFor(req, paymentId) {
+  const host = req.headers.host || 'localhost';
+  const proto = host.includes('localhost') ? 'http' : 'https';
+  return `${proto}://${host}/?payment=${paymentId}`;
+}
 function publicPayment(p) {
   const { ...rest } = p;
   return { ...rest, phone: maskPhone(p.phone) };
@@ -123,18 +146,6 @@ function confirmPayment(p, { method = 'UPI', utr = null, verification = 'observe
   return true;
 }
 
-// WhatsApp Cloud API: approved Authentication template only.
-// POST https://graph.facebook.com/v21.0/<PHONE_NUMBER_ID>/messages
-async function sendWhatsAppOtp(phone, code) {
-  const token = process.env.WHATSAPP_TOKEN, phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID, template = process.env.WHATSAPP_TEMPLATE_NAME || 'otp_code';
-  if (!token || !phoneId) return { delivered: false, mode: 'demo' };
-  const r = await fetch(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
-    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ messaging_product: 'whatsapp', to: `91${phone}`, type: 'template', template: { name: template, language: { code: 'en_US' }, components: [{ type: 'body', parameters: [{ type: 'text', text: code }] }] } }),
-  });
-  if (!r.ok) throw new Error(`WhatsApp API ${r.status}: ${(await r.text()).slice(0, 300)}`);
-  return { delivered: true, mode: 'whatsapp' };
-}
 
 // ---------- http helpers ----------
 function readJson(req) { return new Promise((resolve) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch { resolve({}); } }); }); }
@@ -157,54 +168,27 @@ async function handleApi(req, res, url) {
   // Public merchant branding (no secrets, no bank account numbers)
   if (req.method === 'GET' && url.pathname === '/api/merchant') {
     const m = db.merchant;
-    return send(res, 200, { businessName: m.businessName, upiId: m.upiId, payeeName: m.payeeName, logoUrl: m.logoUrl, primaryColor: m.primaryColor, demoMode: DEMO_MODE });
+    return send(res, 200, { businessName: m.businessName, upiId: m.upiId, payeeName: m.payeeName, logoUrl: m.logoUrl, primaryColor: m.primaryColor, otpRequired: false, version: VERSION });
   }
   // Create a checkout payment. Exactly one ACTIVE UPI payment at a time.
   if (req.method === 'POST' && url.pathname === '/api/checkout') {
+    if (rateLimited(req)) return send(res, 429, { error: 'Too many checkout attempts. Wait a minute and try again.' });
     const body = await readJson(req);
     const amountPaise = paise(body.amount);
     if (!amountPaise || amountPaise <= 0) return send(res, 400, { error: 'Valid amount in rupees is required.' });
     const hasActive = db.payments.some(x => x.status === 'ACTIVE');
-    const p = { id: uid('PAY'), orderId: String(body.orderId || uid('ORD')), description: String(body.description || '').slice(0, 200), amountPaise, currency: 'INR', status: hasActive ? 'QUEUED' : 'ACTIVE', method: 'UPI', phone: '', phoneVerified: false, verification: null, utr: null, createdAt: Date.now(), activatedAt: hasActive ? null : Date.now(), endedAt: null };
+    const p = { id: uid('PAY'), orderId: String(body.orderId || uid('ORD')), description: String(body.description || '').slice(0, 200), amountPaise, currency: 'INR', status: hasActive ? 'QUEUED' : 'ACTIVE', method: 'UPI', phone: String(body.phone || '').slice(0, 15), phoneVerified: true, verification: null, utr: null, notes: body.notes || {}, createdAt: Date.now(), activatedAt: hasActive ? null : Date.now(), endedAt: null };
     db.payments.unshift(p); save(); broadcast(p);
     return send(res, 201, { ...publicPayment(p), position: queuePosition(p) });
   }
-  // Send WhatsApp OTP (real only when WHATSAPP_* configured; otherwise demo code)
-  if (req.method === 'POST' && url.pathname === '/api/otp/send') {
-    const body = await readJson(req);
-    const p = db.payments.find(x => x.id === body.paymentId);
-    if (!p) return send(res, 404, { error: 'Payment not found.' });
-    const phone = cleanPhone(body.phone);
-    if (!isValidPhone(phone)) return send(res, 400, { error: 'Enter a valid 10-digit Indian mobile number.' });
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    otps.set(p.id, { hash: sha(code), expiresAt: Date.now() + 5 * 60 * 1000, attempts: 0, phone });
-    p.phone = phone; save();
-    try {
-      const result = await sendWhatsAppOtp(phone, code);
-      if (result.delivered) return send(res, 200, { delivered: true, mode: 'whatsapp', message: 'OTP sent on WhatsApp.' });
-    } catch (e) { return send(res, 502, { error: 'WhatsApp delivery failed: ' + e.message + ' Check WHATSAPP_TOKEN / PHONE_NUMBER_ID / template approval.' }); }
-    // DEMO fallback — never claim this was sent on WhatsApp.
-    return send(res, 200, { delivered: false, mode: 'demo', demoOtp: code, message: 'Demo mode: WhatsApp is not configured, so the code is shown here. Configure WHATSAPP_* to send it for real.' });
-  }
-  if (req.method === 'POST' && url.pathname === '/api/otp/verify') {
-    const body = await readJson(req);
-    const p = db.payments.find(x => x.id === body.paymentId);
-    const entry = otps.get(body.paymentId);
-    if (!p || !entry) return send(res, 400, { error: 'No OTP was requested for this payment.' });
-    if (Date.now() > entry.expiresAt) return send(res, 400, { error: 'OTP expired. Request a new one.' });
-    if (entry.attempts >= 5) return send(res, 429, { error: 'Too many attempts. Request a new OTP.' });
-    entry.attempts++;
-    if (crypto.timingSafeEqual(Buffer.from(sha(String(body.code || ''))), Buffer.from(entry.hash))) {
-      p.phoneVerified = true; otps.delete(body.paymentId); save(); broadcast(p);
-      return send(res, 200, { verified: true });
-    }
-    return send(res, 400, { error: 'Wrong code. Try again.' });
+  // OTP removed in v2: old clients get a clear 410 instead of hanging.
+  if (req.method === 'POST' && (url.pathname === '/api/otp/send' || url.pathname === '/api/otp/verify')) {
+    return send(res, 410, { error: 'Phone OTP verification was removed. Checkout goes straight to the QR / UPI intent now.' });
   }
   // Payment status + QR (QR only after phone verification and when ACTIVE)
   if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'payments' && parts[3] === 'qr') {
     const p = db.payments.find(x => x.id === parts[2]);
     if (!p) return send(res, 404, { error: 'Payment not found.' });
-    if (!p.phoneVerified) return send(res, 403, { error: 'Verify your phone with the WhatsApp OTP first.' });
     if (p.status !== 'ACTIVE') return send(res, 409, { error: `Payment is ${p.status}. ${p.status === 'QUEUED' ? 'Your turn is coming — position ' + queuePosition(p) + '.' : 'It cannot show a QR now.'}` });
     const upiUri = buildUpiUri({ upiId: db.merchant.upiId, payeeName: db.merchant.payeeName, amountPaise: p.amountPaise, note: p.description || `Order ${p.orderId}`, ref: p.id });
     const qrDataUrl = await QRCode.toDataURL(upiUri, { width: 280, margin: 1 });
@@ -227,6 +211,26 @@ async function handleApi(req, res, url) {
     if (!p) return send(res, 404, { error: 'Payment not found.' });
     if (p.status === 'ACTIVE' || p.status === 'QUEUED') { p.status = 'CANCELLED'; p.endedAt = Date.now(); save(); broadcast(p); promoteNext(); save(); }
     return send(res, 200, publicPayment(p));
+  }
+  // Razorpay-style server API: create an order, then open its checkout_url.
+  // Amount is in PAISE, like Razorpay (4900 = Rs 49.00).
+  if (req.method === 'POST' && url.pathname === '/api/v1/orders') {
+    if (!requireApiKey(req, res)) return;
+    if (rateLimited(req)) return send(res, 429, { error: 'Too many order attempts. Wait a minute and try again.' });
+    const body = await readJson(req);
+    const amountPaise = Number(body.amount);
+    if (!Number.isInteger(amountPaise) || amountPaise <= 0) return send(res, 400, { error: 'amount is required in paise as an integer, e.g. 4900 for Rs 49.00.' });
+    const hasActive = db.payments.some(x => x.status === 'ACTIVE');
+    const p = { id: uid('PAY'), orderId: String(body.receipt || uid('ORD')), description: String(body.notes?.description || '').slice(0, 200), amountPaise, currency: 'INR', status: hasActive ? 'QUEUED' : 'ACTIVE', method: 'UPI', phone: '', phoneVerified: true, verification: null, utr: null, notes: body.notes || {}, createdAt: Date.now(), activatedAt: hasActive ? null : Date.now(), endedAt: null };
+    db.payments.unshift(p); save(); broadcast(p);
+    return send(res, 201, { id: p.id, entity: 'order', amount: amountPaise, amount_paid: 0, amount_due: amountPaise, currency: 'INR', receipt: p.orderId, status: 'created', gateway_status: p.status, checkout_url: checkoutUrlFor(req, p.id) });
+  }
+  if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'v1' && parts[2] === 'orders' && parts[3]) {
+    if (!requireApiKey(req, res)) return;
+    const p = db.payments.find(x => x.id === parts[3] || x.orderId === parts[3]);
+    if (!p) return send(res, 404, { error: 'Order not found.' });
+    const status = p.status === 'CONFIRMED' ? 'paid' : (p.status === 'EXPIRED' || p.status === 'CANCELLED') ? 'attempted' : 'created';
+    return send(res, 200, { id: p.id, entity: 'order', amount: p.amountPaise, amount_paid: p.status === 'CONFIRMED' ? p.amountPaise : 0, amount_due: p.status === 'CONFIRMED' ? 0 : p.amountPaise, currency: 'INR', receipt: p.orderId, status, gateway_status: p.status, utr: p.utr, method: p.method, checkout_url: checkoutUrlFor(req, p.id) });
   }
   // Bank SMS / Gmail alert ingestion — the automated verification step.
   if (req.method === 'POST' && (url.pathname === '/api/verify/sms' || url.pathname === '/api/verify/gmail')) {
@@ -262,6 +266,11 @@ async function handleApi(req, res, url) {
     const active = db.payments.find(x => x.status === 'ACTIVE') || null;
     return send(res, 200, { merchant: db.merchant, active: active ? publicPayment(active) : null, queue: db.payments.filter(x => x.status === 'QUEUED').sort((a, b) => a.createdAt - b.createdAt).map(publicPayment), payments: db.payments.map(publicPayment).slice(0, 200), observations: db.observations.slice(0, 100), webhookLog: db.webhookLog.slice(0, 50), demoMode: DEMO_MODE });
   }
+  if (req.method === 'POST' && url.pathname === '/api/admin/api-key/regenerate') {
+    if (!requireAdmin(req, res)) return;
+    db.merchant.apiKey = 'upg_' + crypto.randomBytes(16).toString('hex'); save();
+    return send(res, 200, { apiKey: db.merchant.apiKey });
+  }
   if (req.method === 'POST' && url.pathname === '/api/admin/merchant') {
     if (!requireAdmin(req, res)) return;
     const body = await readJson(req);
@@ -289,7 +298,7 @@ async function handleApi(req, res, url) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
-    if (url.pathname === '/health') return send(res, 200, { status: 'UP', service: 'upi-gateway', demoMode: DEMO_MODE });
+    if (url.pathname === '/health') return send(res, 200, { status: 'UP', service: 'upi-gateway', version: VERSION, otpRequired: false });
     if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
     if (url.pathname === '/embed.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return res.end(fs.readFileSync(path.join(__dirname, 'public', 'embed.js'))); }
     if (url.pathname === '/admin.html') return sendHtml(res, fs.readFileSync(path.join(__dirname, 'public', 'admin.html'), 'utf8'));
@@ -297,6 +306,6 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(res, 500, { error: String(e.message) }); }
 });
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => console.log(`UPI gateway running at http://localhost:${PORT}  (demo mode: ${DEMO_MODE ? 'WhatsApp OTP shown on screen' : 'WhatsApp Cloud API'})`));
+  server.listen(PORT, '0.0.0.0', () => console.log(`UPI gateway ${VERSION} running at http://localhost:${PORT} (no OTP gate)`));
 }
 module.exports = { buildUpiUri, parseBankAlert, paise, rupees, isValidPhone };
